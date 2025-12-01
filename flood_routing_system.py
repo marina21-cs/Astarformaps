@@ -1,6 +1,7 @@
 """
 A* Pathfinding System with Flood Detection for Malolos, Bulacan, Philippines
-Uses OpenStreetMap data with real road network, one-way streets, and proper routing.
+Uses OpenStreetMap data with real road network, one-way streets, closed roads,
+traffic estimation, and proper routing.
 """
 
 import osmnx as ox
@@ -29,6 +30,16 @@ class Location:
         self.description = description
 
 
+class ClosedRoad:
+    """Represents a closed or restricted road"""
+    def __init__(self, road_id, name, coords, reason="Construction"):
+        self.road_id = road_id
+        self.name = name
+        self.coords = coords  # (lat, lon) center point
+        self.reason = reason  # Construction, Accident, Event, etc.
+        self.is_closed = True
+
+
 class FloodSensor:
     """Simulates flood sensors at specific locations"""
     def __init__(self, sensor_id, location, name):
@@ -48,19 +59,58 @@ class FloodSensor:
 class AStarFloodRouter:
     """A* pathfinding with flood avoidance for Malolos, Bulacan"""
     
+    # Traffic multipliers based on road type and time of day
+    # Based on typical traffic patterns in Philippine cities
+    TRAFFIC_MULTIPLIERS = {
+        'motorway': 1.0,
+        'motorway_link': 1.1,
+        'trunk': 1.2,
+        'trunk_link': 1.2,
+        'primary': 1.5,        # Main roads - higher traffic
+        'primary_link': 1.4,
+        'secondary': 1.3,      # Secondary roads - moderate traffic
+        'secondary_link': 1.3,
+        'tertiary': 1.2,       # Local roads - less traffic
+        'tertiary_link': 1.2,
+        'residential': 1.1,    # Residential - light traffic
+        'living_street': 1.0,
+        'unclassified': 1.2,
+        'service': 1.0,
+    }
+    
+    # Busy streets in Malolos (major thoroughfares with typically high traffic)
+    BUSY_STREETS = [
+        'MacArthur Highway',
+        'Paseo del Congreso',
+        'F. Llamas Street',
+        'Plaridel Bypass Road',
+        'Cagayan Valley Road',
+        'Governor F. Halili Avenue',
+        'Barasoain Street',
+        'Pariancillo Street',
+    ]
+    
     def __init__(self):
         self.G = None
         self.G_original = None
         self.sensors = []
         self.flooded_nodes = set()
         self.flooded_edges = set()
+        self.closed_roads = []
+        self.closed_nodes = set()
+        self.closed_edges = set()
         self.place_name = "Malolos, Bulacan, Philippines"
         self.start_location = None
         self.end_location = None
+        self.node_info = {}  # Store info about how nodes are acquired
         
     def load_map(self):
         """Load real road network from OpenStreetMap"""
         print(f"Loading road network for {self.place_name}...")
+        print("\n📡 NODE ACQUISITION PROCESS:")
+        print("   1. Querying OpenStreetMap Overpass API...")
+        print("   2. Downloading road network within city boundary...")
+        print("   3. Processing network topology...")
         
         # Download the road network with driving directions (respects one-way streets)
         self.G = ox.graph_from_place(
@@ -76,13 +126,114 @@ class AStarFloodRouter:
         self.G = ox.routing.add_edge_speeds(self.G)
         self.G = ox.routing.add_edge_travel_times(self.G)
         
-        print(f"Loaded {len(self.G.nodes)} nodes and {len(self.G.edges)} edges")
+        # Apply traffic multipliers based on road type and busy streets
+        self._apply_traffic_weights()
+        
+        # Store node acquisition info
+        self._collect_node_info()
+        
+        print(f"\n✅ Loaded {len(self.G.nodes)} nodes and {len(self.G.edges)} edges")
+        print(f"   📍 Nodes represent: Road intersections and endpoints")
+        print(f"   🛣️  Edges represent: Road segments connecting nodes")
         return self.G
+    
+    def _apply_traffic_weights(self):
+        """Apply traffic-based weights to edges based on road type and known busy streets"""
+        print("   4. Applying traffic estimation weights...")
+        
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            highway_type = data.get('highway', 'unclassified')
+            if isinstance(highway_type, list):
+                highway_type = highway_type[0]
+            
+            road_name = data.get('name', '')
+            if isinstance(road_name, list):
+                road_name = road_name[0] if road_name else ''
+            
+            # Get base traffic multiplier from road type
+            traffic_mult = self.TRAFFIC_MULTIPLIERS.get(highway_type, 1.2)
+            
+            # Apply additional multiplier for known busy streets
+            if road_name and any(busy in road_name for busy in self.BUSY_STREETS):
+                traffic_mult *= 1.3  # 30% more delay on busy streets
+            
+            # Store traffic info on edge
+            data['traffic_multiplier'] = traffic_mult
+            data['is_busy_street'] = road_name in self.BUSY_STREETS
+            
+            # Adjust travel time based on traffic
+            if 'travel_time' in data:
+                data['travel_time_with_traffic'] = data['travel_time'] * traffic_mult
+    
+    def _collect_node_info(self):
+        """Collect information about nodes for documentation"""
+        self.node_info = {
+            'total_nodes': len(self.G.nodes),
+            'total_edges': len(self.G.edges),
+            'road_types': {},
+            'one_way_roads': 0,
+            'two_way_roads': 0,
+        }
+        
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            highway_type = data.get('highway', 'unclassified')
+            if isinstance(highway_type, list):
+                highway_type = highway_type[0]
+            
+            if highway_type not in self.node_info['road_types']:
+                self.node_info['road_types'][highway_type] = 0
+            self.node_info['road_types'][highway_type] += 1
+            
+            if data.get('oneway', False):
+                self.node_info['one_way_roads'] += 1
+            else:
+                self.node_info['two_way_roads'] += 1
     
     def set_locations(self, start_location, end_location):
         """Set named start and end locations"""
         self.start_location = start_location
         self.end_location = end_location
+    
+    def setup_closed_roads(self):
+        """Set up closed/restricted roads in Malolos"""
+        # Simulate some closed roads due to construction, events, etc.
+        closed_road_data = [
+            (14.8460, 120.8130, "Barasoain Street Section", "Road Construction"),
+            (14.8500, 120.8180, "Near Public Market", "Utility Maintenance"),
+        ]
+        
+        for i, (lat, lon, name, reason) in enumerate(closed_road_data):
+            road = ClosedRoad(i, name, (lat, lon), reason)
+            self.closed_roads.append(road)
+        
+        print(f"⚠️  {len(self.closed_roads)} road closures registered")
+        return self.closed_roads
+    
+    def apply_road_closures(self, closure_radius=80):
+        """Apply road closures to the graph"""
+        self.closed_nodes = set()
+        self.closed_edges = set()
+        
+        for road in self.closed_roads:
+            if road.is_closed:
+                lat, lon = road.coords
+                
+                for node in self.G.nodes():
+                    node_lat = self.G.nodes[node]['y']
+                    node_lon = self.G.nodes[node]['x']
+                    
+                    dist = self.haversine_distance((lat, lon), (node_lat, node_lon))
+                    
+                    if dist <= closure_radius:
+                        self.closed_nodes.add(node)
+        
+        # Find all edges connected to closed nodes
+        for u, v, k in self.G.edges(keys=True):
+            if u in self.closed_nodes or v in self.closed_nodes:
+                self.closed_edges.add((u, v, k))
+        
+        print(f"   🚧 Road closures affect {len(self.closed_nodes)} nodes and {len(self.closed_edges)} road segments")
+        return self.closed_nodes, self.closed_edges
     
     def setup_flood_sensors(self):
         """Set up flood sensors at strategic locations in Malolos"""
@@ -169,13 +320,23 @@ class AStarFloodRouter:
         lat2, lon2 = self.G.nodes[node2]['y'], self.G.nodes[node2]['x']
         return self.haversine_distance((lat1, lon1), (lat2, lon2))
     
-    def a_star_search(self, start_node, end_node, avoid_flooded=True):
+    def get_blocked_nodes(self):
+        """Get all blocked nodes (flooded + closed roads)"""
+        return self.flooded_nodes | self.closed_nodes
+    
+    def get_blocked_edges(self):
+        """Get all blocked edges (flooded + closed roads)"""
+        return self.flooded_edges | self.closed_edges
+    
+    def a_star_search(self, start_node, end_node, avoid_blocked=True, use_traffic=True):
         """
-        A* pathfinding algorithm with flood avoidance
-        Returns: (path, total_distance, total_time)
+        A* pathfinding algorithm with flood and road closure avoidance
+        Returns: (path, total_distance, total_time, total_time_with_traffic)
         """
         if start_node not in self.G.nodes or end_node not in self.G.nodes:
-            return None, float('inf'), float('inf')
+            return None, float('inf'), float('inf'), float('inf')
+        
+        blocked_nodes = self.get_blocked_nodes() if avoid_blocked else set()
         
         # Priority queue: (f_score, counter, node)
         counter = 0
@@ -205,6 +366,7 @@ class AStarFloodRouter:
                 # Calculate total distance and time
                 total_distance = 0
                 total_time = 0
+                total_time_traffic = 0
                 for i in range(len(path) - 1):
                     edge_data = self.G.get_edge_data(path[i], path[i+1])
                     if edge_data:
@@ -212,17 +374,18 @@ class AStarFloodRouter:
                         first_edge = list(edge_data.values())[0]
                         total_distance += first_edge.get('length', 0)
                         total_time += first_edge.get('travel_time', 0)
+                        total_time_traffic += first_edge.get('travel_time_with_traffic', first_edge.get('travel_time', 0))
                 
-                return path, total_distance, total_time
+                return path, total_distance, total_time, total_time_traffic
             
-            # Check if current node is flooded
-            if avoid_flooded and current in self.flooded_nodes:
+            # Check if current node is blocked
+            if avoid_blocked and current in blocked_nodes:
                 continue
             
             # Explore neighbors
             for neighbor in self.G.neighbors(current):
-                # Skip flooded nodes
-                if avoid_flooded and neighbor in self.flooded_nodes:
+                # Skip blocked nodes
+                if avoid_blocked and neighbor in blocked_nodes:
                     continue
                 
                 # Get edge data
@@ -230,9 +393,12 @@ class AStarFloodRouter:
                 if not edge_data:
                     continue
                 
-                # Use travel time as the cost (considers speed limits and road types)
+                # Use travel time with traffic as the cost
                 first_edge = list(edge_data.values())[0]
-                edge_cost = first_edge.get('travel_time', first_edge.get('length', 1))
+                if use_traffic:
+                    edge_cost = first_edge.get('travel_time_with_traffic', first_edge.get('travel_time', first_edge.get('length', 1)))
+                else:
+                    edge_cost = first_edge.get('travel_time', first_edge.get('length', 1))
                 
                 tentative_g_score = g_score[current] + edge_cost
                 
@@ -246,7 +412,7 @@ class AStarFloodRouter:
                         heapq.heappush(open_set, (f_score[neighbor], counter, neighbor))
                         open_set_hash.add(neighbor)
         
-        return None, float('inf'), float('inf')  # No path found
+        return None, float('inf'), float('inf'), float('inf')  # No path found
     
     def get_bearing(self, coord1, coord2):
         """Calculate bearing between two coordinates"""
@@ -370,9 +536,27 @@ class AStarFloodRouter:
                         roads.append(road_name)
         return roads
     
+    def get_busy_streets_on_path(self, path):
+        """Get list of busy streets on a path"""
+        if not path:
+            return []
+        
+        busy = []
+        for i in range(len(path) - 1):
+            edge_data = self.G.get_edge_data(path[i], path[i + 1])
+            if edge_data:
+                first_edge = list(edge_data.values())[0]
+                if first_edge.get('is_busy_street', False):
+                    road_name = first_edge.get('name', 'Unknown')
+                    if isinstance(road_name, list):
+                        road_name = road_name[0]
+                    if road_name not in busy:
+                        busy.append(road_name)
+        return busy
+    
     def find_route_with_flood_avoidance(self, start_coords, end_coords):
         """
-        Find routes: original and alternative (avoiding floods)
+        Find routes: original and alternative (avoiding floods and closed roads)
         start_coords, end_coords: (lat, lon) tuples
         """
         start_node = self.get_nearest_node(*start_coords)
@@ -381,29 +565,46 @@ class AStarFloodRouter:
         print(f"\nFinding routes from {start_coords} to {end_coords}")
         print(f"Start node: {start_node}, End node: {end_node}")
         
-        # Find original route (ignoring floods)
-        original_path, orig_dist, orig_time = self.a_star_search(
-            start_node, end_node, avoid_flooded=False
+        # Find original route (ignoring blocks, with traffic)
+        original_path, orig_dist, orig_time, orig_time_traffic = self.a_star_search(
+            start_node, end_node, avoid_blocked=False, use_traffic=True
         )
         
-        # Find alternative route (avoiding floods)
-        alt_path, alt_dist, alt_time = self.a_star_search(
-            start_node, end_node, avoid_flooded=True
+        # Find alternative route (avoiding floods and closed roads, with traffic)
+        alt_path, alt_dist, alt_time, alt_time_traffic = self.a_star_search(
+            start_node, end_node, avoid_blocked=True, use_traffic=True
         )
         
         return {
             'original': {
                 'path': original_path,
                 'distance': orig_dist,
-                'time': orig_time
+                'time': orig_time,
+                'time_with_traffic': orig_time_traffic
             },
             'alternative': {
                 'path': alt_path,
                 'distance': alt_dist,
-                'time': alt_time
+                'time': alt_time,
+                'time_with_traffic': alt_time_traffic
             },
             'start_node': start_node,
             'end_node': end_node
+        }
+    
+    def get_route_bounds(self, path, padding=0.003):
+        """Get bounding box for a route with padding for zooming"""
+        if not path:
+            return None
+        
+        lats = [self.G.nodes[n]['y'] for n in path]
+        lons = [self.G.nodes[n]['x'] for n in path]
+        
+        return {
+            'min_lat': min(lats) - padding,
+            'max_lat': max(lats) + padding,
+            'min_lon': min(lons) - padding,
+            'max_lon': max(lons) + padding
         }
 
 
@@ -412,11 +613,28 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
     
     print(f"\nGenerating PDF report: {output_file}")
     
-    # Get route directions
+    # Get route directions and info
     original_directions = router.get_route_directions(routes['original']['path'])
     alternative_directions = router.get_route_directions(routes['alternative']['path'])
     original_roads = router.get_roads_on_path(routes['original']['path'])
     alternative_roads = router.get_roads_on_path(routes['alternative']['path'])
+    original_busy = router.get_busy_streets_on_path(routes['original']['path'])
+    alternative_busy = router.get_busy_streets_on_path(routes['alternative']['path'])
+    
+    # Get route bounds for zooming
+    orig_bounds = router.get_route_bounds(routes['original']['path'], padding=0.005)
+    alt_bounds = router.get_route_bounds(routes['alternative']['path'], padding=0.005)
+    
+    # Combine bounds for comparison view
+    if orig_bounds and alt_bounds:
+        combined_bounds = {
+            'min_lat': min(orig_bounds['min_lat'], alt_bounds['min_lat']),
+            'max_lat': max(orig_bounds['max_lat'], alt_bounds['max_lat']),
+            'min_lon': min(orig_bounds['min_lon'], alt_bounds['min_lon']),
+            'max_lon': max(orig_bounds['max_lon'], alt_bounds['max_lon'])
+        }
+    else:
+        combined_bounds = orig_bounds or alt_bounds
     
     with PdfPages(output_file) as pdf:
         # Page 1: Title and Overview
@@ -463,19 +681,156 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
             spine.set_color('#007bff')
             spine.set_linewidth(2)
         
-        # System Features
+        # System Features - Updated with traffic and road closures
         features_text = """
         SYSTEM FEATURES:
-        ✓ Real OpenStreetMap road data        ✓ Respects one-way streets
-        ✓ A* optimal pathfinding              ✓ Real-time flood detection
-        ✓ Smart rerouting algorithm           ✓ Turn-by-turn directions
+        ✓ Real OpenStreetMap road data        ✓ Respects one-way streets & road closures
+        ✓ A* optimal pathfinding              ✓ Real-time flood detection sensors
+        ✓ Traffic-aware routing               ✓ Busy street identification
+        ✓ Smart rerouting algorithm           ✓ Turn-by-turn directions with road names
         """
         fig.text(0.1, 0.18, features_text, fontsize=10, va='top', family='sans-serif', color='#2c3e50')
         
         pdf.savefig(fig)
         plt.close()
         
-        # Page 2: Flood Sensors Map
+        # Page 2: Node Acquisition & Network Info
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor('white')
+        fig.text(0.5, 0.94, '🗺️ HOW NODES ARE ACQUIRED', fontsize=18, ha='center', fontweight='bold', color='#1a5276')
+        fig.text(0.5, 0.90, 'Understanding the Road Network Data Source', fontsize=11, ha='center', style='italic', color='#7f8c8d')
+        
+        # Data Source Box
+        ax_source = fig.add_axes([0.08, 0.65, 0.84, 0.20])
+        ax_source.set_facecolor('#e8f4f8')
+        ax_source.set_xlim(0, 1)
+        ax_source.set_ylim(0, 1)
+        ax_source.axis('off')
+        
+        ax_source.text(0.5, 0.85, '📡 DATA SOURCE: OpenStreetMap (OSM)', fontsize=14, ha='center', fontweight='bold', color='#1a5276')
+        ax_source.text(0.05, 0.6, '• OpenStreetMap is a collaborative, free geographic database', fontsize=10, ha='left', color='#2c3e50')
+        ax_source.text(0.05, 0.4, '• Data is contributed by volunteers worldwide and regularly updated', fontsize=10, ha='left', color='#2c3e50')
+        ax_source.text(0.05, 0.2, '• Accessed via Overpass API using OSMnx Python library', fontsize=10, ha='left', color='#2c3e50')
+        
+        for spine in ax_source.spines.values():
+            spine.set_visible(True)
+            spine.set_color('#3498db')
+            spine.set_linewidth(2)
+        
+        # Node Acquisition Process
+        y_pos = 0.58
+        fig.text(0.08, y_pos, '📋 NODE ACQUISITION PROCESS:', fontsize=12, fontweight='bold', color='#2c3e50')
+        
+        steps = [
+            ('1️⃣', 'Query OSM Overpass API with city boundary (Malolos, Bulacan)'),
+            ('2️⃣', 'Filter for drivable roads only (network_type="drive")'),
+            ('3️⃣', 'Extract road intersections as NODES (vertices)'),
+            ('4️⃣', 'Extract road segments as EDGES (connections between nodes)'),
+            ('5️⃣', 'Simplify network topology (remove redundant nodes)'),
+            ('6️⃣', 'Add speed limits and travel time estimates per road type'),
+            ('7️⃣', 'Apply traffic multipliers based on road classification'),
+        ]
+        
+        y_pos -= 0.04
+        for icon, text in steps:
+            fig.text(0.10, y_pos, f'{icon} {text}', fontsize=10, color='#2c3e50')
+            y_pos -= 0.035
+        
+        # Network Statistics Box
+        ax_stats = fig.add_axes([0.08, 0.08, 0.84, 0.18])
+        ax_stats.set_facecolor('#d5f4e6')
+        ax_stats.set_xlim(0, 1)
+        ax_stats.set_ylim(0, 1)
+        ax_stats.axis('off')
+        
+        ax_stats.text(0.5, 0.85, '📊 NETWORK STATISTICS', fontsize=12, ha='center', fontweight='bold', color='#155724')
+        
+        node_info = router.node_info
+        ax_stats.text(0.15, 0.55, f"Total Nodes: {node_info['total_nodes']:,}", fontsize=11, ha='left', color='#2c3e50')
+        ax_stats.text(0.50, 0.55, f"Total Edges: {node_info['total_edges']:,}", fontsize=11, ha='left', color='#2c3e50')
+        ax_stats.text(0.15, 0.25, f"One-way Roads: {node_info['one_way_roads']:,}", fontsize=11, ha='left', color='#2c3e50')
+        ax_stats.text(0.50, 0.25, f"Two-way Roads: {node_info['two_way_roads']:,}", fontsize=11, ha='left', color='#2c3e50')
+        
+        for spine in ax_stats.spines.values():
+            spine.set_visible(True)
+            spine.set_color('#28a745')
+            spine.set_linewidth(2)
+        
+        pdf.savefig(fig)
+        plt.close()
+        
+        # Page 3: Traffic & Road Classification
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor('white')
+        fig.text(0.5, 0.94, '🚦 TRAFFIC ESTIMATION & ROAD CLASSIFICATION', fontsize=18, ha='center', fontweight='bold', color='#1a5276')
+        
+        # Traffic Multipliers Table
+        y_pos = 0.85
+        fig.text(0.08, y_pos, '📈 TRAFFIC MULTIPLIERS BY ROAD TYPE:', fontsize=12, fontweight='bold', color='#2c3e50')
+        y_pos -= 0.03
+        
+        fig.text(0.10, y_pos, 'Road Type', fontsize=10, fontweight='bold', color='#2c3e50')
+        fig.text(0.40, y_pos, 'Traffic Factor', fontsize=10, fontweight='bold', color='#2c3e50')
+        fig.text(0.60, y_pos, 'Description', fontsize=10, fontweight='bold', color='#2c3e50')
+        fig.add_artist(plt.Line2D([0.08, 0.92], [y_pos - 0.01, y_pos - 0.01], color='#2c3e50', linewidth=1))
+        y_pos -= 0.035
+        
+        traffic_info = [
+            ('Primary Road', '1.5x', 'Main roads - heavy traffic (e.g., MacArthur Highway)'),
+            ('Secondary Road', '1.3x', 'Secondary roads - moderate traffic'),
+            ('Tertiary Road', '1.2x', 'Local roads - light to moderate traffic'),
+            ('Residential', '1.1x', 'Residential streets - light traffic'),
+            ('Busy Street Bonus', '+30%', 'Additional delay for known busy streets'),
+        ]
+        
+        for road_type, factor, desc in traffic_info:
+            fig.text(0.10, y_pos, road_type, fontsize=9, color='#2c3e50')
+            fig.text(0.40, y_pos, factor, fontsize=9, color='#e74c3c', fontweight='bold')
+            fig.text(0.60, y_pos, desc, fontsize=9, color='#7f8c8d')
+            y_pos -= 0.03
+        
+        # Known Busy Streets Box
+        y_pos -= 0.02
+        ax_busy = fig.add_axes([0.08, y_pos - 0.18, 0.84, 0.18])
+        ax_busy.set_facecolor('#fff3cd')
+        ax_busy.set_xlim(0, 1)
+        ax_busy.set_ylim(0, 1)
+        ax_busy.axis('off')
+        
+        ax_busy.text(0.5, 0.85, '🚗 KNOWN BUSY STREETS IN MALOLOS', fontsize=11, ha='center', fontweight='bold', color='#856404')
+        
+        busy_streets = router.BUSY_STREETS[:6]
+        col1 = busy_streets[:3]
+        col2 = busy_streets[3:6]
+        
+        for i, street in enumerate(col1):
+            ax_busy.text(0.15, 0.55 - i*0.18, f'• {street}', fontsize=9, color='#856404')
+        for i, street in enumerate(col2):
+            ax_busy.text(0.55, 0.55 - i*0.18, f'• {street}', fontsize=9, color='#856404')
+        
+        for spine in ax_busy.spines.values():
+            spine.set_visible(True)
+            spine.set_color('#ffc107')
+            spine.set_linewidth(2)
+        
+        # Road Closures Section
+        y_pos -= 0.25
+        fig.text(0.08, y_pos, '🚧 ACTIVE ROAD CLOSURES:', fontsize=12, fontweight='bold', color='#2c3e50')
+        y_pos -= 0.035
+        
+        if router.closed_roads:
+            for road in router.closed_roads:
+                status = "🔴 CLOSED" if road.is_closed else "🟢 Open"
+                fig.text(0.10, y_pos, f'{status} - {road.name}', fontsize=10, color='#e74c3c' if road.is_closed else '#27ae60')
+                fig.text(0.55, y_pos, f'Reason: {road.reason}', fontsize=9, color='#7f8c8d')
+                y_pos -= 0.03
+        else:
+            fig.text(0.10, y_pos, 'No road closures currently registered', fontsize=10, color='#27ae60')
+        
+        pdf.savefig(fig)
+        plt.close()
+        
+        # Page 4: Flood Sensors Map (zoomed to route area)
         fig, ax = plt.subplots(figsize=(11, 8.5))
         fig.patch.set_facecolor('white')
         ax.set_title('FLOOD SENSOR NETWORK - Malolos City, Bulacan\n(Strategic Monitoring Points)', 
@@ -583,31 +938,40 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
         pdf.savefig(fig)
         plt.close()
         
-        # Page 4: Original Route Map
+        # Page 6: Original Route Map (ZOOMED)
         fig, ax = plt.subplots(figsize=(11, 8.5))
         fig.patch.set_facecolor('white')
-        ax.set_title(f'ORIGINAL ROUTE (Without Flood Consideration)\n{start_name} → {end_name}', 
+        ax.set_title(f'ORIGINAL ROUTE (Zoomed View)\n{start_name} → {end_name}', 
                     fontsize=14, fontweight='bold', pad=20, color='#2980b9')
         
-        ox.plot_graph(router.G, ax=ax, node_size=0, edge_color='#ecf0f1', 
-                     edge_linewidth=0.5, bgcolor='white', show=False, close=False)
+        ox.plot_graph(router.G, ax=ax, node_size=0, edge_color='#d5d8dc', 
+                     edge_linewidth=0.8, bgcolor='white', show=False, close=False)
+        
+        # Plot closed road areas with construction markers
+        for road in router.closed_roads:
+            if road.is_closed:
+                ax.scatter(road.coords[1], road.coords[0], c='orange', s=300, 
+                          marker='s', zorder=4, edgecolors='darkorange', linewidths=2)
+                circle = plt.Circle((road.coords[1], road.coords[0]), 
+                                   0.001, color='orange', alpha=0.3, zorder=2)
+                ax.add_patch(circle)
         
         # Plot flooded nodes with X markers
         for node in router.flooded_nodes:
             ax.scatter(router.G.nodes[node]['x'], router.G.nodes[node]['y'], 
-                      c='red', s=50, marker='x', alpha=0.7, zorder=3, linewidths=1.5)
+                      c='red', s=60, marker='x', alpha=0.8, zorder=3, linewidths=2)
         
         if routes['original']['path']:
-            # Plot original route
+            # Plot original route with thicker line
             route_coords = [(router.G.nodes[n]['x'], router.G.nodes[n]['y']) 
                            for n in routes['original']['path']]
             xs, ys = zip(*route_coords)
-            ax.plot(xs, ys, color='#3498db', linewidth=4, label='Original Route', zorder=4, solid_capstyle='round')
+            ax.plot(xs, ys, color='#3498db', linewidth=5, label='Original Route', zorder=4, solid_capstyle='round')
             
-            # Add road name labels along the route
+            # Add road name labels along the route - more frequent for zoomed view
             labeled_roads = set()
             for i in range(len(routes['original']['path']) - 1):
-                if i % 5 == 0:  # Label every 5th segment
+                if i % 3 == 0:  # Label every 3rd segment for zoomed view
                     u, v = routes['original']['path'][i], routes['original']['path'][i + 1]
                     edge_data = router.G.get_edge_data(u, v)
                     if edge_data:
@@ -619,93 +983,115 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
                             if road_name not in labeled_roads:
                                 mid_x = (router.G.nodes[u]['x'] + router.G.nodes[v]['x']) / 2
                                 mid_y = (router.G.nodes[u]['y'] + router.G.nodes[v]['y']) / 2
-                                ax.annotate(road_name, (mid_x, mid_y), fontsize=6, 
-                                           ha='center', va='bottom', color='#2c3e50',
-                                           bbox=dict(boxstyle='round,pad=0.15', facecolor='#ebf5fb', alpha=0.9, edgecolor='#3498db'))
+                                ax.annotate(road_name, (mid_x, mid_y), fontsize=7, 
+                                           ha='center', va='bottom', color='#1a5276',
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='#ebf5fb', alpha=0.95, edgecolor='#3498db'),
+                                           zorder=10)
                                 labeled_roads.add(road_name)
         
         # Plot start and end points with better markers
         start_node = routes['start_node']
         end_node = routes['end_node']
         ax.scatter(router.G.nodes[start_node]['x'], router.G.nodes[start_node]['y'], 
-                  c='#27ae60', s=300, marker='o', zorder=6, edgecolors='white', linewidths=3)
+                  c='#27ae60', s=400, marker='o', zorder=7, edgecolors='white', linewidths=3)
         ax.scatter(router.G.nodes[end_node]['x'], router.G.nodes[end_node]['y'], 
-                  c='#e74c3c', s=300, marker='o', zorder=6, edgecolors='white', linewidths=3)
+                  c='#e74c3c', s=400, marker='o', zorder=7, edgecolors='white', linewidths=3)
         
         # Add location labels
         ax.annotate(f'START\n{start_name}', 
                    (router.G.nodes[start_node]['x'], router.G.nodes[start_node]['y']),
-                   fontsize=8, ha='center', va='bottom', xytext=(0, 15), textcoords='offset points',
+                   fontsize=9, ha='center', va='bottom', xytext=(0, 18), textcoords='offset points',
                    fontweight='bold', color='#27ae60',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#27ae60', alpha=0.95))
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#27ae60', alpha=0.98))
         ax.annotate(f'END\n{end_name}', 
                    (router.G.nodes[end_node]['x'], router.G.nodes[end_node]['y']),
-                   fontsize=8, ha='center', va='bottom', xytext=(0, 15), textcoords='offset points',
+                   fontsize=9, ha='center', va='bottom', xytext=(0, 18), textcoords='offset points',
                    fontweight='bold', color='#e74c3c',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#e74c3c', alpha=0.95))
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#e74c3c', alpha=0.98))
         
-        # Route info box
+        # ZOOM to route bounds
+        if orig_bounds:
+            ax.set_xlim(orig_bounds['min_lon'], orig_bounds['max_lon'])
+            ax.set_ylim(orig_bounds['min_lat'], orig_bounds['max_lat'])
+        
+        # Route info box with traffic time
         orig_dist = routes['original']['distance']
         orig_time = routes['original']['time']
-        info_text = f"📏 Distance: {orig_dist/1000:.2f} km  |  ⏱️ Travel Time: {orig_time/60:.1f} minutes"
-        ax.text(0.5, -0.08, info_text, transform=ax.transAxes, ha='center', fontsize=11, fontweight='bold',
+        orig_time_traffic = routes['original'].get('time_with_traffic', orig_time)
+        info_text = f"📏 Distance: {orig_dist/1000:.2f} km  |  ⏱️ Base Time: {orig_time/60:.1f} min  |  🚦 With Traffic: {orig_time_traffic/60:.1f} min"
+        ax.text(0.5, -0.06, info_text, transform=ax.transAxes, ha='center', fontsize=10, fontweight='bold',
                bbox=dict(boxstyle='round,pad=0.5', facecolor='#ebf5fb', edgecolor='#3498db'))
         
         # Legend
         legend_elements = [
-            Line2D([0], [0], color='#3498db', linewidth=3, label='Original Route'),
+            Line2D([0], [0], color='#3498db', linewidth=4, label='Original Route'),
             Line2D([0], [0], marker='x', color='w', markerfacecolor='red', 
-                   markersize=10, label='Flooded Node (Blocked)', markeredgecolor='red'),
+                   markersize=10, label='Flooded Node', markeredgecolor='red', markeredgewidth=2),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='orange', 
+                   markersize=10, label='🚧 Road Closure', markeredgecolor='darkorange'),
             Line2D([0], [0], marker='o', color='w', markerfacecolor='#27ae60', 
-                   markersize=12, label='Start Point'),
+                   markersize=12, label='Start'),
             Line2D([0], [0], marker='o', color='w', markerfacecolor='#e74c3c', 
-                   markersize=12, label='End Point'),
+                   markersize=12, label='End'),
         ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.95)
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.98)
         
         pdf.savefig(fig, bbox_inches='tight')
         plt.close()
         
-        # Page 5: Alternative Route Map
+        # Page 7: Alternative Route Map (ZOOMED)
         fig, ax = plt.subplots(figsize=(11, 8.5))
         fig.patch.set_facecolor('white')
-        ax.set_title(f'ALTERNATIVE ROUTE (Avoiding Flood Zones)\n{start_name} → {end_name}', 
+        ax.set_title(f'ALTERNATIVE ROUTE - FLOOD-FREE PATH (Zoomed View)\n{start_name} → {end_name}', 
                     fontsize=14, fontweight='bold', pad=20, color='#27ae60')
         
-        ox.plot_graph(router.G, ax=ax, node_size=0, edge_color='#ecf0f1', 
-                     edge_linewidth=0.5, bgcolor='white', show=False, close=False)
+        ox.plot_graph(router.G, ax=ax, node_size=0, edge_color='#d5d8dc', 
+                     edge_linewidth=0.8, bgcolor='white', show=False, close=False)
+        
+        # Plot closed road areas
+        for road in router.closed_roads:
+            if road.is_closed:
+                ax.scatter(road.coords[1], road.coords[0], c='orange', s=300, 
+                          marker='s', zorder=4, edgecolors='darkorange', linewidths=2)
+                circle = plt.Circle((road.coords[1], road.coords[0]), 
+                                   0.001, color='orange', alpha=0.3, zorder=2)
+                ax.add_patch(circle)
+                ax.annotate(f'🚧 {road.name}\n{road.reason}', (road.coords[1], road.coords[0]),
+                           fontsize=7, ha='center', va='top', xytext=(0, -15), textcoords='offset points',
+                           color='darkorange', fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='#fff3cd', edgecolor='orange', alpha=0.95))
         
         # Plot flooded areas with prominent X markers and circles
         for sensor in router.sensors:
             if sensor.is_flooded:
                 # Large flood zone circle
                 circle = plt.Circle((sensor.location[1], sensor.location[0]), 
-                                   0.002, color='red', alpha=0.25, zorder=2)
+                                   0.0015, color='red', alpha=0.3, zorder=2)
                 ax.add_patch(circle)
                 # X marker at sensor
-                ax.scatter(sensor.location[1], sensor.location[0], c='red', s=400, 
-                          marker='X', zorder=5, edgecolors='darkred', linewidths=2)
+                ax.scatter(sensor.location[1], sensor.location[0], c='red', s=500, 
+                          marker='X', zorder=5, edgecolors='darkred', linewidths=3)
                 ax.annotate(f'⚠️ {sensor.name}\nFLOODED', (sensor.location[1], sensor.location[0]),
-                           fontsize=7, ha='center', va='top', xytext=(0, -20), textcoords='offset points',
+                           fontsize=8, ha='center', va='top', xytext=(0, -22), textcoords='offset points',
                            color='darkred', fontweight='bold',
-                           bbox=dict(boxstyle='round,pad=0.2', facecolor='#fadbd8', edgecolor='red', alpha=0.95))
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='#fadbd8', edgecolor='red', alpha=0.98))
         
         # Plot flooded nodes
         for node in router.flooded_nodes:
             ax.scatter(router.G.nodes[node]['x'], router.G.nodes[node]['y'], 
-                      c='red', s=30, marker='x', alpha=0.5, zorder=3, linewidths=1)
+                      c='red', s=40, marker='x', alpha=0.6, zorder=3, linewidths=1.5)
         
         if routes['alternative']['path']:
-            # Plot alternative route
+            # Plot alternative route with thick line
             route_coords = [(router.G.nodes[n]['x'], router.G.nodes[n]['y']) 
                            for n in routes['alternative']['path']]
             xs, ys = zip(*route_coords)
-            ax.plot(xs, ys, color='#27ae60', linewidth=4, label='Alternative Route', zorder=4, solid_capstyle='round')
+            ax.plot(xs, ys, color='#27ae60', linewidth=5, label='Alternative Route', zorder=4, solid_capstyle='round')
             
-            # Add road name labels
+            # Add road name labels - more frequent for zoomed view
             labeled_roads = set()
             for i in range(len(routes['alternative']['path']) - 1):
-                if i % 5 == 0:
+                if i % 3 == 0:
                     u, v = routes['alternative']['path'][i], routes['alternative']['path'][i + 1]
                     edge_data = router.G.get_edge_data(u, v)
                     if edge_data:
@@ -717,9 +1103,10 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
                             if road_name not in labeled_roads:
                                 mid_x = (router.G.nodes[u]['x'] + router.G.nodes[v]['x']) / 2
                                 mid_y = (router.G.nodes[u]['y'] + router.G.nodes[v]['y']) / 2
-                                ax.annotate(road_name, (mid_x, mid_y), fontsize=6,
+                                ax.annotate(road_name, (mid_x, mid_y), fontsize=7,
                                            ha='center', va='bottom', color='#145a32',
-                                           bbox=dict(boxstyle='round,pad=0.15', facecolor='#d5f4e6', alpha=0.9, edgecolor='#27ae60'))
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='#d5f4e6', alpha=0.95, edgecolor='#27ae60'),
+                                           zorder=10)
                                 labeled_roads.add(road_name)
         else:
             ax.text(0.5, 0.5, '⚠️ NO ALTERNATIVE ROUTE FOUND', transform=ax.transAxes,
@@ -728,38 +1115,46 @@ def generate_pdf_report(router, routes, output_file="flood_routing_report.pdf"):
         
         # Plot start and end points
         ax.scatter(router.G.nodes[start_node]['x'], router.G.nodes[start_node]['y'], 
-                  c='#27ae60', s=300, marker='o', zorder=6, edgecolors='white', linewidths=3)
+                  c='#27ae60', s=400, marker='o', zorder=7, edgecolors='white', linewidths=3)
         ax.scatter(router.G.nodes[end_node]['x'], router.G.nodes[end_node]['y'], 
-                  c='#e74c3c', s=300, marker='o', zorder=6, edgecolors='white', linewidths=3)
+                  c='#e74c3c', s=400, marker='o', zorder=7, edgecolors='white', linewidths=3)
         
         # Add location labels
         ax.annotate(f'START\n{start_name}', 
                    (router.G.nodes[start_node]['x'], router.G.nodes[start_node]['y']),
-                   fontsize=8, ha='center', va='bottom', xytext=(0, 15), textcoords='offset points',
+                   fontsize=9, ha='center', va='bottom', xytext=(0, 18), textcoords='offset points',
                    fontweight='bold', color='#27ae60',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#27ae60', alpha=0.95))
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#27ae60', alpha=0.98))
         ax.annotate(f'END\n{end_name}', 
                    (router.G.nodes[end_node]['x'], router.G.nodes[end_node]['y']),
-                   fontsize=8, ha='center', va='bottom', xytext=(0, 15), textcoords='offset points',
+                   fontsize=9, ha='center', va='bottom', xytext=(0, 18), textcoords='offset points',
                    fontweight='bold', color='#e74c3c',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#e74c3c', alpha=0.95))
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='#e74c3c', alpha=0.98))
         
-        # Route info box
+        # ZOOM to route bounds
+        if alt_bounds:
+            ax.set_xlim(alt_bounds['min_lon'], alt_bounds['max_lon'])
+            ax.set_ylim(alt_bounds['min_lat'], alt_bounds['max_lat'])
+        
+        # Route info box with traffic time
         alt_dist = routes['alternative']['distance']
         alt_time = routes['alternative']['time']
+        alt_time_traffic = routes['alternative'].get('time_with_traffic', alt_time)
         if alt_dist < float('inf'):
-            info_text = f"📏 Distance: {alt_dist/1000:.2f} km  |  ⏱️ Travel Time: {alt_time/60:.1f} minutes"
+            info_text = f"📏 Distance: {alt_dist/1000:.2f} km  |  ⏱️ Base Time: {alt_time/60:.1f} min  |  🚦 With Traffic: {alt_time_traffic/60:.1f} min"
         else:
             info_text = "⚠️ No safe route available"
-        ax.text(0.5, -0.08, info_text, transform=ax.transAxes, ha='center', fontsize=11, fontweight='bold',
+        ax.text(0.5, -0.06, info_text, transform=ax.transAxes, ha='center', fontsize=10, fontweight='bold',
                bbox=dict(boxstyle='round,pad=0.5', facecolor='#d5f4e6', edgecolor='#27ae60'))
         
         # Legend
         legend_elements = [
-            Line2D([0], [0], color='#27ae60', linewidth=3, label='Alternative Route (Safe)'),
+            Line2D([0], [0], color='#27ae60', linewidth=4, label='Alternative Route (Safe)'),
             Line2D([0], [0], marker='X', color='w', markerfacecolor='red', 
-                   markersize=12, label='⚠️ Flood Sensor (Active)', markeredgecolor='darkred'),
-            mpatches.Patch(color='red', alpha=0.25, label='Flood Zone (Blocked)'),
+                   markersize=12, label='⚠️ Flood Zone', markeredgecolor='darkred'),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='orange', 
+                   markersize=10, label='🚧 Road Closure', markeredgecolor='darkorange'),
+            mpatches.Patch(color='red', alpha=0.3, label='Blocked Area'),
         ]
         ax.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.95)
         
@@ -1086,6 +1481,15 @@ def main():
     print(f"     📍 {end_location.description}")
     print(f"     📐 Coordinates: {end_location.coords}")
     
+    # Setup and apply road closures
+    print("\n" + "=" * 70)
+    print("🚧 ROAD CLOSURES")
+    print("=" * 70)
+    router.setup_closed_roads()
+    router.apply_road_closures(closure_radius=80)
+    for road in router.closed_roads:
+        print(f"  🔴 {road.name} - {road.reason}")
+    
     # Simulate flood at specific sensors blocking the main route
     print("\n" + "=" * 70)
     print("⚠️  FLOOD SIMULATION")
@@ -1096,15 +1500,22 @@ def main():
         print(f"  ❌ Sensor {idx}: {router.sensors[idx].name}")
     router.simulate_flood(flooded_sensors, flood_radius=120)  # Moderate flood radius
     
+    # Display total blocked areas
+    blocked_nodes = router.get_blocked_nodes()
+    blocked_edges = router.get_blocked_edges()
+    print(f"\n📊 Total blocked: {len(blocked_nodes)} nodes, {len(blocked_edges)} road segments")
+    
     # Find routes
     print("\n" + "=" * 70)
-    print("🛣️  ROUTE CALCULATION")
+    print("🛣️  ROUTE CALCULATION (Traffic-Aware)")
     print("=" * 70)
     routes = router.find_route_with_flood_avoidance(start_location.coords, end_location.coords)
     
-    # Get road names on routes
+    # Get road names and busy streets
     original_roads = router.get_roads_on_path(routes['original']['path'])
     alternative_roads = router.get_roads_on_path(routes['alternative']['path'])
+    original_busy = router.get_busy_streets_on_path(routes['original']['path'])
+    alternative_busy = router.get_busy_streets_on_path(routes['alternative']['path'])
     
     # Display results
     print("\n" + "=" * 70)
@@ -1114,20 +1525,26 @@ def main():
     if routes['original']['path']:
         print(f"\n📍 Original Route:")
         print(f"   Distance: {routes['original']['distance']/1000:.2f} km")
-        print(f"   Travel Time: {routes['original']['time']/60:.1f} minutes")
+        print(f"   Base Travel Time: {routes['original']['time']/60:.1f} minutes")
+        print(f"   🚦 With Traffic: {routes['original'].get('time_with_traffic', routes['original']['time'])/60:.1f} minutes")
         print(f"   Nodes in path: {len(routes['original']['path'])}")
         if original_roads:
             print(f"   Roads: {', '.join(original_roads[:5])}")
+        if original_busy:
+            print(f"   ⚠️ Busy Streets: {', '.join(original_busy)}")
     else:
         print("\n❌ Original Route: NO PATH FOUND")
     
     if routes['alternative']['path']:
-        print(f"\n✅ Alternative Route (avoiding floods):")
+        print(f"\n✅ Alternative Route (avoiding floods & closures):")
         print(f"   Distance: {routes['alternative']['distance']/1000:.2f} km")
-        print(f"   Travel Time: {routes['alternative']['time']/60:.1f} minutes")
+        print(f"   Base Travel Time: {routes['alternative']['time']/60:.1f} minutes")
+        print(f"   🚦 With Traffic: {routes['alternative'].get('time_with_traffic', routes['alternative']['time'])/60:.1f} minutes")
         print(f"   Nodes in path: {len(routes['alternative']['path'])}")
         if alternative_roads:
             print(f"   Roads: {', '.join(alternative_roads[:5])}")
+        if alternative_busy:
+            print(f"   ⚠️ Busy Streets: {', '.join(alternative_busy)}")
         
         # Compare routes
         if routes['original']['path']:
@@ -1151,14 +1568,16 @@ def main():
     print(f"\n📁 PDF Report: {pdf_file}")
     print("\nThe report includes:")
     print("  📌 1. Title page with location information")
-    print("  📌 2. Flood sensor network map")
-    print("  📌 3. Detailed sensor status report")
-    print("  📌 4. Original route with road names")
-    print("  📌 5. Alternative route with flood zones marked")
-    print("  📌 6. Route comparison overlay")
-    print("  📌 7. Turn-by-turn directions")
-    print("  📌 8. Route analysis summary")
-    print("  📌 9. A* algorithm technical details")
+    print("  📌 2. Node acquisition & network info")
+    print("  📌 3. Traffic estimation & road classification")
+    print("  📌 4. Flood sensor network map")
+    print("  📌 5. Detailed sensor status report")
+    print("  📌 6. Original route (zoomed) with road names")
+    print("  📌 7. Alternative route (zoomed) with blocked areas")
+    print("  📌 8. Route comparison overlay")
+    print("  📌 9. Turn-by-turn directions")
+    print("  📌 10. Route analysis summary")
+    print("  📌 11. A* algorithm technical details")
     
     return router, routes
 
